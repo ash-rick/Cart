@@ -101,7 +101,7 @@ export async function couponStatus(code: string): Promise<string> {
 
 /**
  * Forces a race. Holds SHARE ROW EXCLUSIVE on `table` (reads pass, INSERT/UPDATE block),
- * starts `fire()`, waits until `waiters` statements are queued on that lock, then
+ * starts `fire()`, waits until `waiters` statements are queued on a lock, then
  * releases it. Every request has done its reads by then, so all of them act on the same
  * stale snapshot at once, instead of finishing one by one because the transactions are short.
  */
@@ -118,8 +118,10 @@ export async function raceBehindTableLock<T>(
     const deadline = Date.now() + 10_000;
     for (;;) {
       const { rows } = await client.query<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM pg_locks WHERE NOT granted AND relation = $1::regclass`,
-        [table],
+        // Any waiter counts: on this table, or on a lock the app takes before writing it
+        // (coupon generation queues on an advisory lock first).
+        `SELECT COUNT(*) AS n FROM pg_locks l JOIN pg_database d ON d.oid = l.database
+          WHERE NOT l.granted AND d.datname = current_database()`,
       );
       if (rows[0]!.n >= waiters) break;
       if (Date.now() > deadline) throw new Error(`only ${rows[0]!.n}/${waiters} requests blocked`);

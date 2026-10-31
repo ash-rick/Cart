@@ -15,7 +15,9 @@ export interface CouponListItem extends CouponView {
   redeemedAt: string | null;
 }
 
-const MAX_ATTEMPTS = 3;
+// Any constant works: it only has to be the same for every generate call, on every
+// app instance, since they all share the database.
+const GENERATE_LOCK_KEY = 728_001;
 
 // No 0/O or 1/I, so codes survive being read aloud or retyped. 32 symbols divide 256
 // evenly, so `byte % 32` is unbiased.
@@ -38,11 +40,15 @@ export interface MilestoneProgress {
 /**
  * Creates one coupon for the lowest unrewarded milestone that has been reached.
  *
- * Two concurrent calls can both compute the same nextMilestone. The UNIQUE(milestone)
- * constraint, not this code, is what stops both from inserting it: the loser gets a
- * unique violation (23505), its transaction is rolled back, and the whole thing is retried.
- * The retry re-reads MAX(milestone) and may legitimately pick the NEXT milestone if
- * several are pending.
+ * Generate calls are serialized with a transaction-scoped advisory lock: the second call
+ * waits until the first commits, then reads the new MAX(milestone). So concurrent calls
+ * never compute the same milestone, and with k milestones pending, k simultaneous calls
+ * each get one. The lock lives in Postgres, so it works across app instances, and it is
+ * released automatically at COMMIT/ROLLBACK. UNIQUE(milestone) remains the backstop: if
+ * this lock were removed, a duplicate would fail (as a 500) rather than be created.
+ *
+ * (A first version retried on the unique violation instead. Review showed that many
+ * pending milestones plus many simultaneous calls exhausted the retries and produced 500s.)
  *
  * Why a stale order count is safe under READ COMMITTED: COUNT(*) may miss an order that
  * commits a moment later. Orders are never deleted, so the count we read is only ever
@@ -51,34 +57,28 @@ export interface MilestoneProgress {
  * milestone that has not been reached.
  */
 export async function generateCoupon(pool: Pool, config: Config): Promise<CouponView> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await withTransaction(pool, async (client) => {
-        const progress = await milestoneProgress(client, config.couponEveryNOrders);
-        if (progress.ordersUntilNextMilestone > 0) {
-          throw errors.noEligibleMilestone({ ...progress });
-        }
-        const { rows } = await client.query<{
-          code: string;
-          milestone: number;
-          percent: number;
-          status: CouponView['status'];
-          createdAt: Date;
-        }>(
-          `INSERT INTO coupons (code, milestone, percent, status)
-           VALUES ($1, $2, $3, 'AVAILABLE')
-           RETURNING code, milestone, percent, status, created_at AS "createdAt"`,
-          [generateCode(), progress.nextMilestone, config.couponPercent],
-        );
-        const c = rows[0]!;
-        return { ...c, createdAt: c.createdAt.toISOString() };
-      });
-    } catch (err) {
-      // Lost the race for this milestone (or, astronomically unlikely, a code collision).
-      if (isUniqueViolation(err) && attempt < MAX_ATTEMPTS) continue;
-      throw err;
+  return withTransaction(pool, async (client) => {
+    await client.query('SELECT pg_advisory_xact_lock($1)', [GENERATE_LOCK_KEY]);
+
+    const progress = await milestoneProgress(client, config.couponEveryNOrders);
+    if (progress.ordersUntilNextMilestone > 0) {
+      throw errors.noEligibleMilestone({ ...progress });
     }
-  }
+    const { rows } = await client.query<{
+      code: string;
+      milestone: number;
+      percent: number;
+      status: CouponView['status'];
+      createdAt: Date;
+    }>(
+      `INSERT INTO coupons (code, milestone, percent, status)
+       VALUES ($1, $2, $3, 'AVAILABLE')
+       RETURNING code, milestone, percent, status, created_at AS "createdAt"`,
+      [generateCode(), progress.nextMilestone, config.couponPercent],
+    );
+    const c = rows[0]!;
+    return { ...c, createdAt: c.createdAt.toISOString() };
+  });
 }
 
 async function milestoneProgress(
@@ -96,17 +96,6 @@ async function milestoneProgress(
     nextMilestone,
     ordersUntilNextMilestone: Math.max(nextMilestone * n - ordersPlaced, 0),
   };
-}
-
-function isUniqueViolation(err: unknown): boolean {
-  return (
-    typeof err === 'object' &&
-    err !== null &&
-    'code' in err &&
-    err.code === '23505' &&
-    'constraint' in err &&
-    (err.constraint === 'coupons_milestone_unique' || err.constraint === 'coupons_code_unique')
-  );
 }
 
 export async function listCoupons(pool: Pool): Promise<CouponListItem[]> {
