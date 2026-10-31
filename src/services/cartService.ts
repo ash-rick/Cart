@@ -38,9 +38,13 @@ export interface CartView {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+export function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
 /** A malformed id cannot name an existing cart, so it is a 404, not a 400 or a pg cast error. */
 export function assertCartId(cartId: string): void {
-  if (!UUID_RE.test(cartId)) throw errors.cartNotFound(cartId);
+  if (!isUuid(cartId)) throw errors.cartNotFound(cartId);
 }
 
 type Queryable = Pool | DbClient;

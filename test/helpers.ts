@@ -62,6 +62,22 @@ export async function cartWith(
   return cartId;
 }
 
+export function checkout(app: FastifyInstance, cartId: string, body: Record<string, unknown> = {}) {
+  return app.inject({ method: 'POST', url: `/carts/${cartId}/checkout`, payload: body });
+}
+
+export async function countRows(table: 'orders' | 'order_lines' | 'coupons'): Promise<number> {
+  const { rows } = await db().query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`);
+  return rows[0]!.n;
+}
+
+export async function cartStatus(cartId: string): Promise<string> {
+  const { rows } = await db().query<{ status: string }>(`SELECT status FROM carts WHERE id = $1`, [
+    cartId,
+  ]);
+  return rows[0]!.status;
+}
+
 export async function stockOf(productId: string): Promise<number> {
   const { rows } = await db().query<{ stock: number }>(`SELECT stock FROM products WHERE id = $1`, [
     productId,

@@ -5,6 +5,7 @@ import { createPool, type Pool } from './db';
 import { AppError, errorBody, errors } from './errors';
 import { cartRoutes } from './routes/carts';
 import { healthRoutes } from './routes/health';
+import { orderRoutes } from './routes/orders';
 import { productRoutes } from './routes/products';
 
 declare module 'fastify' {
@@ -34,6 +35,7 @@ export async function buildApp(configOverrides: Partial<Config> = {}): Promise<F
   await app.register(healthRoutes);
   await app.register(productRoutes);
   await app.register(cartRoutes);
+  await app.register(orderRoutes);
   return app;
 }
 
