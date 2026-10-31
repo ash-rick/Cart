@@ -246,6 +246,6 @@ Example: the state at the end of `requests.http`.
 6. **`itemCount`** is total units. CLAUDE.md doesn't define it.
 7. **`DELETE` with an unknown product** returns 200 (idempotent delete), not 422 `PRODUCT_NOT_FOUND`.
 8. **Extra DB constraints** beyond CLAUDE.md: `carts_checked_out_at_matches_status` and `orders_coupon_snapshot_complete` (coupon id, code and percent are all set or all null).
-9. **Coupon generation is serialized** with a Postgres advisory lock, not CLAUDE.md's "retry on unique violation". Review found the bounded retry produced 500s under concurrent admin calls (see docs/FLOWS.md §9).
+9. **Coupon generation is serialized** with a Postgres advisory lock, not the "retry on unique violation" approach from TASKS.md Task 7. Review found the bounded retry produced 500s under concurrent admin calls (see docs/FLOWS.md §9).
 10. **Malformed product ids and coupon codes are 400**, not 422 `PRODUCT_NOT_FOUND` / `COUPON_NOT_FOUND`. They are rejected before any lookup, which keeps odd bytes (e.g. NUL, invalid in Postgres text) away from SQL.
-11. **Stack:** Vitest is pinned to v3, because Vitest 4+ requires Node 22, while CLAUDE.md promises Node 20+.
+11. **Stack:** Vitest is pinned to v3, because the current Vitest (v5) requires Node 22.12+, while CLAUDE.md promises Node 20+.
