@@ -66,6 +66,57 @@ export function checkout(app: FastifyInstance, cartId: string, body: Record<stri
   return app.inject({ method: 'POST', url: `/carts/${cartId}/checkout`, payload: body });
 }
 
+/** Places k orders through the API, one sku_sticker each. Returns the order ids. */
+export async function placeOrders(app: FastifyInstance, k: number): Promise<string[]> {
+  const ids: string[] = [];
+  for (let i = 0; i < k; i++) {
+    const res = await checkout(app, await cartWith(app, { sku_sticker: 1 }));
+    if (res.statusCode !== 201) throw new Error(`placeOrders failed: ${res.statusCode} ${res.body}`);
+    ids.push(res.json().id);
+  }
+  return ids;
+}
+
+export function generateCoupon(app: FastifyInstance) {
+  return app.inject({ method: 'POST', url: '/admin/coupons' });
+}
+
+/**
+ * Forces a race. Holds SHARE ROW EXCLUSIVE on `table` (reads pass, INSERT/UPDATE block),
+ * starts `fire()`, waits until `waiters` statements are queued on that lock, then
+ * releases it. Every request has done its reads by then, so all of them act on the same
+ * stale snapshot at once, instead of finishing one by one because the transactions are short.
+ */
+export async function raceBehindTableLock<T>(
+  table: 'coupons' | 'orders',
+  waiters: number,
+  fire: () => Promise<T>,
+): Promise<T> {
+  const client = await db().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`LOCK TABLE ${table} IN SHARE ROW EXCLUSIVE MODE`);
+    const pending = fire();
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const { rows } = await client.query<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM pg_locks WHERE NOT granted AND relation = $1::regclass`,
+        [table],
+      );
+      if (rows[0]!.n >= waiters) break;
+      if (Date.now() > deadline) throw new Error(`only ${rows[0]!.n}/${waiters} requests blocked`);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await client.query('COMMIT');
+    return await pending;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export async function countRows(table: 'orders' | 'order_lines' | 'coupons'): Promise<number> {
   const { rows } = await db().query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`);
   return rows[0]!.n;

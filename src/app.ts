@@ -3,6 +3,7 @@ import { ZodError } from 'zod';
 import { loadConfig, type Config } from './config';
 import { createPool, type Pool } from './db';
 import { AppError, errorBody, errors } from './errors';
+import { adminRoutes } from './routes/admin';
 import { cartRoutes } from './routes/carts';
 import { healthRoutes } from './routes/health';
 import { orderRoutes } from './routes/orders';
@@ -36,6 +37,7 @@ export async function buildApp(configOverrides: Partial<Config> = {}): Promise<F
   await app.register(productRoutes);
   await app.register(cartRoutes);
   await app.register(orderRoutes);
+  await app.register(adminRoutes);
   return app;
 }
 
