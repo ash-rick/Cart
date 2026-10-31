@@ -1,5 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { generateCoupon, listCoupons } from '../services/couponService';
+import { getReport } from '../services/reportService';
 
 // Administrative operations. Auth is out of scope; the /admin prefix marks them as privileged.
 export async function adminRoutes(app: FastifyInstance): Promise<void> {
@@ -8,4 +9,6 @@ export async function adminRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get('/admin/coupons', async () => listCoupons(app.db));
+
+  app.get('/admin/report', async () => getReport(app.db, app.config));
 }
