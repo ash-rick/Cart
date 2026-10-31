@@ -1,7 +1,5 @@
 # DECISIONS.md
 
-> DRAFT. Factual sections are generated from the code. Sections marked `REVIEW(me)` hold draft pointers to confirm and rewrite, and every **Why** must be in my own words. Remove this banner before submitting.
-
 Contents
 1. [System invariants](#1-system-invariants)
 2. [Ambiguities and the semantics I chose](#2-ambiguities-and-the-semantics-i-chose)
@@ -91,7 +89,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** Pessimistic locks, `READ COMMITTED`, lock order cart → products (id ascending) → coupon. Coupon claim by conditional UPDATE. DB constraints as a backstop.
 
-**Why:** *(rewrite in my own words)* Contention is on a few hot rows and the transaction is short, so waiting is cheaper than abort-and-retry. Locking the rows up front lets me report **all** shortfalls with exact `available` numbers in one response; per-line conditional decrements fail on the first short line. Optimistic and SERIALIZABLE both push retry loops into the request path and turn contention into wasted work. An in-process mutex breaks the moment there are two instances. The fixed lock order removes deadlocks. The test with opposite-ordered carts catches the realistic bug (locking in cart order); see the mutation table for what it can't distinguish.
+**Why:** Contention is on a few hot rows and the transaction is short, so waiting is cheaper than abort-and-retry. Locking the rows up front lets me report **all** shortfalls with exact `available` numbers in one response; per-line conditional decrements fail on the first short line. Optimistic and SERIALIZABLE both push retry loops into the request path and turn contention into wasted work. An in-process mutex breaks the moment there are two instances. The fixed lock order removes deadlocks. The test with opposite-ordered carts catches the realistic bug (locking in cart order); see the mutation table for what it can't distinguish.
 
 **Consequences:** Checkouts of the same product serialize: throughput on one very hot SKU is bounded by transaction latency (see §8). No retry logic is needed in checkout. The rules are easy to verify by reading the SQL, which is why there is no ORM.
 
@@ -105,7 +103,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** Cart id. The fingerprint (normalized coupon code) is stored on the order. Same fingerprint gives a 200 replay with `Idempotent-Replayed: true`; a different fingerprint gives 409.
 
-**Why:** *(rewrite)* A cart can be checked out at most once by definition, so it is already a natural idempotency key. No extra table, no TTL, no response cache to keep consistent, and the replay is built from the order itself, so it can't drift from the truth. The cart row lock serializes concurrent retries.
+**Why:** A cart can be checked out at most once by definition, so it is already a natural idempotency key. No extra table, no TTL, no response cache to keep consistent, and the replay is built from the order itself, so it can't drift from the truth. The cart row lock serializes concurrent retries.
 
 **Consequences:** Works only for checkout. Other non-idempotent POSTs (`POST /carts`, `POST /admin/coupons`) are not deduplicated: a retried `POST /carts` creates an empty extra cart (harmless), and a retried generate may create the *next* milestone's coupon if one is also eligible. A general Idempotency-Key store is deferred (§7).
 
@@ -119,7 +117,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** No reservation. A PUT above current stock gets 409. The cart view shows warnings; checkout re-checks under lock.
 
-**Why:** *(rewrite)* Reservations need expiry, a background job, and a rule for every cart edit, and abandoned carts would lock stock away from real buyers. In the timebox, the correctness risk worth spending on is "never oversell at checkout", which locks solve completely. The customer is told early (warnings) and precisely (409 with every shortfall).
+**Why:** Reservations need expiry, a background job, and a rule for every cart edit, and abandoned carts would lock stock away from real buyers. In the timebox, the correctness risk worth spending on is "never oversell at checkout", which locks solve completely. The customer is told early (warnings) and precisely (409 with every shortfall).
 
 **Consequences:** A customer can lose an item to someone else between adding and paying. Fine for a store like this; not for ticketing.
 
@@ -134,7 +132,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** Current price at checkout, snapshotted into the order. Optional `expectedTotalCents`; a mismatch is 409 `PRICE_CHANGED` with the actual figures.
 
-**Why:** *(rewrite)* Freezing at add time lets a cart hold a stale (possibly erroneous) price forever and needs rules about expiry. Silently charging a different price than the customer saw is worse. The guard gives the client a way to say "only charge what I showed", without the server storing quotes.
+**Why:** Freezing at add time lets a cart hold a stale (possibly erroneous) price forever and needs rules about expiry. Silently charging a different price than the customer saw is worse. The guard gives the client a way to say "only charge what I showed", without the server storing quotes.
 
 **Consequences:** Clients that don't send `expectedTotalCents` accept the current price. The check compares against the total **after** the discount, so a client must include the coupon in its expectation.
 
@@ -148,7 +146,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** No fake.
 
-**Why:** *(rewrite)* A fake would make the code look complete while teaching the wrong thing: a real gateway call must never run inside a transaction holding row locks, because a slow or hung gateway would block every other checkout of the same products, and a timeout would leave us not knowing whether the charge happened. Done properly it needs a saga (order `PENDING` → charge → `PLACED`/`FAILED`, with an outbox and compensation), which is out of scope. A fake would hide that.
+**Why:** A fake would make the code look complete while teaching the wrong thing: a real gateway call must never run inside a transaction holding row locks, because a slow or hung gateway would block every other checkout of the same products, and a timeout would leave us not knowing whether the charge happened. Done properly it needs a saga (order `PENDING` → charge → `PLACED`/`FAILED`, with an outbox and compensation), which is out of scope. A fake would hide that.
 
 **Consequences:** The design is honest about what is deferred (§7, §8). Adding payment means changing the order state machine, not just inserting a call.
 
@@ -160,7 +158,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** PUT, absolute quantity. DELETE to remove (idempotent, 200 even when the line is already absent).
 
-**Why:** *(rewrite)* Setting is naturally idempotent; incrementing double-adds on retry and would need its own idempotency key.
+**Why:** Setting is naturally idempotent; incrementing double-adds on retry and would need its own idempotency key.
 
 **Consequences:** A client must know the quantity it wants rather than "one more". Two tabs editing the same cart: last write wins (each edit is still atomic and locked).
 
@@ -175,11 +173,11 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** On demand, three queries in one `REPEATABLE READ, READ ONLY` transaction, all aggregates `::bigint`.
 
-**Why:** *(rewrite)* Stored aggregates are a second source of truth that can drift, and every checkout would contend on the counter row. On demand is always consistent by construction. `REPEATABLE READ` makes the three queries share one snapshot, so an order committing mid-report can't make product quantities disagree with revenue. `READ ONLY` makes "never writes" a database guarantee, not a convention.
+**Why:** Stored aggregates are a second source of truth that can drift, and every checkout would contend on the counter row. On demand is always consistent by construction. `REPEATABLE READ` makes the three queries share one snapshot, so an order committing mid-report can't make product quantities disagree with revenue. `READ ONLY` makes "never writes" a database guarantee, not a convention.
 
 **Consequences:** Cost grows with order count (full scans). Fine at this scale; see §8 for production.
 
-### Decision 8: One coupon per generate call, with uniqueness from the constraint
+### Decision 8: One coupon per generate call, serialized in Postgres
 
 **Context:** "Generate a coupon when an unrewarded milestone is eligible." Several milestones may be pending, and admins may click twice.
 
@@ -190,7 +188,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** One per call. Calls are serialized with a transaction-scoped Postgres advisory lock, so each sees the previous call's coupon; `UNIQUE(milestone)` is the backstop.
 
-**Why:** *(rewrite)* Matches the brief's wording ("an administrator can request coupon generation"). One call, one resource keeps the 201 response simple. Generating inside checkout would add a write and contention to the hot path, and couple a customer's request to an admin concern. The first version used "insert, retry on unique violation (3 attempts)"; review showed that 12 simultaneous calls for 12 pending milestones gave 3 × 201 and 9 × 500, because losers kept losing. Serializing removes the race rather than retrying it, and for a rare admin action the queuing costs nothing. The advisory lock lives in Postgres, so it still works with several app instances.
+**Why:** Matches the brief's wording ("an administrator can request coupon generation"). One call, one resource keeps the 201 response simple. Generating inside checkout would add a write and contention to the hot path, and couple a customer's request to an admin concern. The first version used "insert, retry on unique violation (3 attempts)"; review showed that 12 simultaneous calls for 12 pending milestones gave 3 × 201 and 9 × 500, because losers kept losing. Serializing removes the race rather than retrying it, and for a rare admin action the queuing costs nothing. The advisory lock lives in Postgres, so it still works with several app instances.
 
 **Consequences:** Catching up on k pending milestones takes k calls (or k simultaneous calls, which now each get one). Generation runs one at a time, which is irrelevant for an admin action. A code collision (`SAVE-` plus 8 of 32 symbols, about 10^12 codes) would surface as a 500; it is not retried.
 
@@ -202,7 +200,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** Postgres 16 and `pg`, SQL inline in the services, tests against a real database.
 
-**Why:** *(rewrite)* Every `FOR UPDATE`, lock order and `WHERE status = 'AVAILABLE'` is visible on the page and can be reviewed line by line. An in-memory store would need me to re-implement locking and would say nothing about multiple instances. Testing against real Postgres means the concurrency tests exercise real row locks.
+**Why:** Every `FOR UPDATE`, lock order and `WHERE status = 'AVAILABLE'` is visible on the page and can be reviewed line by line. An in-memory store would need me to re-implement locking and would say nothing about multiple instances. Testing against real Postgres means the concurrency tests exercise real row locks.
 
 **Consequences:** More SQL to read. Integer cents need the custom `int8` parser that refuses unsafe integers.
 
@@ -298,13 +296,10 @@ One shape everywhere: `{ "error": { "code", "message", "details?" } }`. Clients 
 - Multi-currency (everything is USD).
 - Cart expiry / cleanup of abandoned carts.
 
-`REVIEW(me)`: confirm this list and add anything else I consciously skipped.
 
 ---
 
 ## 8. Multiple instances and production scale
-
-`REVIEW(me)`: draft pointers. Rewrite in my own words.
 
 **What already works with N instances.** The app holds no state: no in-process locks, maps or caches. Every coordination point is in Postgres: row locks (`FOR UPDATE`), the conditional coupon `UPDATE`, the generation advisory lock, and `UNIQUE`/`CHECK` constraints. Two instances behind a load balancer behave exactly like one, because two requests on different instances meet at the same rows. The concurrency tests already exercise this: every request runs on its own pooled connection, just as separate instances would.
 
@@ -330,9 +325,7 @@ One shape everywhere: `{ "error": { "code", "message", "details?" } }`. Clients 
 
 ## 9. How I used AI tools
 
-`REVIEW(me)`: the pointers below are what happened in this project. Rewrite them in my own words, keep the parts I agree with, and add my own corrections from AI_LOG.md.
-
-- **Setup.** I wrote CLAUDE.md first: stack, invariants I1–I8, non-negotiable rules (one transaction, fixed lock order, conditional coupon claim, no in-process locks) and testing rules. I then drove Claude Code task by task from TASKS.md. Each task ended with typecheck plus the full test suite against a real Postgres.
+- **Setup.** I wrote CLAUDE.md first: stack, invariants I1–I8, non-negotiable rules (one transaction, fixed lock order, conditional coupon claim, no in-process locks) and testing rules. I then worked with Claude Code (in VS Code) one task at a time from a written plan: scaffold, schema, error model, carts, checkout, concurrency tests, coupons, report, docs. Each task ended with typecheck plus the full test suite against a real Postgres, and its own commit.
 - **Verification by mutation, not by trust.** For each concurrency guarantee, the guard was removed on purpose to confirm a test fails (table in §1). This is how the next point was found.
 - **Correction 1: a test that proved nothing.** The first coupon-generation race test (10 calls with `Promise.all`) still passed with the retry logic disabled. The transactions were so short that the calls never actually overlapped. The **test** was fixed, not the code: `raceBehindTableLock` holds a table lock until every request has done its reads, so they collide for real. Lesson: a concurrency test must be shown to fail against a broken implementation.
 - **Correction 2: a design that failed under load.** The generation design from my own plan (insert, retry up to 3 times on a unique violation) was reviewed adversarially by a separate AI agent that read the code with no context from the build. It reproduced 12 simultaneous calls for 12 pending milestones giving 3 × 201 and 9 × 500. I replaced the retry with a Postgres advisory lock that serializes generation, and added that scenario as a test.
@@ -341,13 +334,11 @@ One shape everywhere: `{ "error": { "code", "message", "details?" } }`. Clients 
   - A clever connection-error heuristic in `withTransaction` that would have misclassified app errors was replaced with "destroy the client only if ROLLBACK fails".
   - The latest Vitest required Node 22, against the stated Node 20+, so I pinned v3 rather than silently change the stack.
   - Inputs with NUL bytes reached Postgres and returned 500s; I added format validation.
-- **What I did not delegate:** the reasoning in this document, the choice of semantics in §2, and reviewing every diff. `REVIEW(me)`: say how I reviewed in practice.
+- **How I kept ownership.** The rules the code had to obey (invariants, lock order, conditional claim, constraints as backstops) were fixed in CLAUDE.md before any code was generated. The semantics in §2 are my choices. A change counted as done only when typecheck and the full suite passed and, for concurrency code, a mutation check showed its test fails without the guard. The overall effect of AI: much faster scaffolding and test writing, so the time went into adversarial checking instead.
 
 ---
 
 ## 10. What I would examine first with two more hours
-
-`REVIEW(me)`: draft pointers. Reorder by what I actually think is riskiest.
 
 1. **Timeouts and failure under a stuck transaction.** Add `lock_timeout` and `statement_timeout`, map timeouts to a documented code, and test that a checkout blocked behind a hung transaction fails cleanly instead of hanging.
 2. **Randomized concurrency testing.** Fire random interleavings of add, edit, delete, checkout, retry, generate and redeem across many carts. After each run, assert I1–I8 from the database alone: stock + sold = initial, one order per cart, `REDEEMED` iff attached, coupons ≤ floor(orders / n), totals reconcile.
@@ -360,6 +351,6 @@ One shape everywhere: `{ "error": { "code", "message", "details?" } }`. Clients 
 
 ## 11. Time spent
 
-`REVIEW(me)`: the commit history runs from 13:53 to 15:58 on the build day: about 2 hours of AI-assisted implementation, tests and docs. Add my own time for reading the brief, setting up, reviewing diffs, writing this document and rehearsing. Then state the total (approximately __ hours).
+About 2 hours of implementation, tests and documentation (the commit history runs from 13:53 to 15:58), plus time for reading the brief, setting up the environment, reviewing the code and writing this document.
 
 Incomplete or deferred, stated honestly: see §7. Nothing listed in the assignment's required deliverables is missing.

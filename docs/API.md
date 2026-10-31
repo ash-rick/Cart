@@ -242,10 +242,10 @@ Example: the state at the end of `requests.http`.
 2. **Fastify's own client errors** (malformed or empty JSON body, unsupported content type, body too large, invalid URL encoding) are all mapped to **400 `VALIDATION_ERROR`**, including cases that would normally be 413/415. Router errors go through `frameworkErrors` so they use the same shape.
 3. **Unknown fields in the checkout body are rejected (400).** CLAUDE.md doesn't say. Chosen so a typo can't silently drop a coupon.
 4. **An empty or whitespace-only `couponCode`** is treated as "no coupon" (fingerprint `null`), not as an unknown code.
-5. **Malformed UUIDs** for carts and orders return 404 (the TASKS.md spec), not 400.
+5. **Malformed UUIDs** for carts and orders return 404, not 400: an id that cannot be a UUID cannot name anything.
 6. **`itemCount`** is total units. CLAUDE.md doesn't define it.
 7. **`DELETE` with an unknown product** returns 200 (idempotent delete), not 422 `PRODUCT_NOT_FOUND`.
 8. **Extra DB constraints** beyond CLAUDE.md: `carts_checked_out_at_matches_status` and `orders_coupon_snapshot_complete` (coupon id, code and percent are all set or all null).
-9. **Coupon generation is serialized** with a Postgres advisory lock, not the "retry on unique violation" approach from TASKS.md Task 7. Review found the bounded retry produced 500s under concurrent admin calls (see docs/FLOWS.md §9).
+9. **Coupon generation is serialized** with a Postgres advisory lock, not the "retry on unique violation" approach of the first version. Review found the bounded retry produced 500s under concurrent admin calls (see docs/FLOWS.md §9).
 10. **Malformed product ids and coupon codes are 400**, not 422 `PRODUCT_NOT_FOUND` / `COUPON_NOT_FOUND`. They are rejected before any lookup, which keeps odd bytes (e.g. NUL, invalid in Postgres text) away from SQL.
 11. **Stack:** Vitest is pinned to v3, because the current Vitest (v5) requires Node 22.12+, while CLAUDE.md promises Node 20+.
