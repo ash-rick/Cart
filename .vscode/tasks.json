@@ -1,0 +1,74 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "DB: up",
+      "type": "shell",
+      "command": "npm run db:up",
+      "problemMatcher": []
+    },
+    {
+      "label": "DB: down",
+      "type": "shell",
+      "command": "npm run db:down",
+      "problemMatcher": []
+    },
+    {
+      "label": "DB: reset (dev)",
+      "type": "shell",
+      "command": "npm run db:reset",
+      "dependsOn": "DB: up",
+      "problemMatcher": []
+    },
+    {
+      "label": "Dev server",
+      "type": "shell",
+      "command": "npm run dev",
+      "dependsOn": "DB: up",
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Typecheck",
+      "type": "shell",
+      "command": "npm run typecheck",
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "Test: all",
+      "type": "shell",
+      "command": "npm test",
+      "dependsOn": "DB: up",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Test: concurrency only",
+      "type": "shell",
+      "command": "npm test -- concurrency",
+      "dependsOn": "DB: up",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Test: watch",
+      "type": "shell",
+      "command": "npm run test:watch",
+      "dependsOn": "DB: up",
+      "presentation": { "panel": "dedicated" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Verify (typecheck + tests)",
+      "dependsOrder": "sequence",
+      "dependsOn": ["Typecheck", "Test: all"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Demo: checkout race",
+      "type": "shell",
+      "command": "npm run demo:race",
+      "problemMatcher": []
+    }
+  ]
+}
