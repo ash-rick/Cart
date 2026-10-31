@@ -170,7 +170,7 @@ sequenceDiagram
   B->>DB: COMMIT
 ```
 
-If each locked in the order its items were added, A would hold mug while B held cap, and each would wait on the other forever. Postgres would detect that and kill one of them with error 40P01 (a 500). The test `30 carts with the same two products in opposite orders` proves sorted locking avoids this. With unsorted locks it fails with 500s.
+If each locked in the order its items were added, A would hold mug while B held cap, and each would wait on the other forever. Postgres would detect that and kill one of them with error 40P01 (a 500). The test `30 carts with the same two products in opposite orders` catches the realistic bug, locking in cart order: it then fails with 500s. Be precise about what it does **not** prove. Simply deleting `ORDER BY id` still passes, because on a 6-row table every transaction's seq scan locks rows in the same physical order. That order is not guaranteed in general (a different plan, or synchronized seq scans on a large table, can change it), so `ORDER BY id` is the guarantee rather than an accident.
 
 ---
 
@@ -237,38 +237,38 @@ There is no third outcome where the order says 1 and the cart says 2. That's wha
 
 ```mermaid
 flowchart TD
-  start([POST /admin/coupons]) --> tx["BEGIN<br/>ordersPlaced = COUNT orders<br/>next = MAX milestone + 1"]
+  start([POST /admin/coupons]) --> lock["BEGIN<br/>pg_advisory_xact_lock(GENERATE)<br/>(other generate calls queue here)"]
+  lock --> tx["ordersPlaced = COUNT orders<br/>next = MAX milestone + 1"]
   tx --> q{"next x n <= ordersPlaced?"}
   q -- no --> e[409 NO_ELIGIBLE_MILESTONE<br/>n, ordersPlaced, nextMilestone,<br/>ordersUntilNextMilestone]:::err
   q -- yes --> ins["INSERT coupon<br/>milestone = next, percent from config<br/>code = SAVE-XXXXXXXX"]
-  ins --> u{unique violation<br/>on milestone?}
-  u -- no --> ok[COMMIT: 201 coupon]:::ok
-  u -- "yes: another admin call won" --> retry{attempt < 3?}
-  retry -- yes --> tx
-  retry -- no --> fail[500]:::err
+  ins --> ok[COMMIT: 201 coupon<br/>lock released]:::ok
 
   classDef err fill:#fde2e1,stroke:#c0392b,color:#000
   classDef ok fill:#dff5e1,stroke:#27ae60,color:#000
 ```
 
-Ten admin calls at once with 3 orders placed (n = 3):
+Ten admin calls at once with 6 orders placed (n = 3, so milestones 1 and 2 are pending):
 
 ```mermaid
 sequenceDiagram
   participant A1 as Admin call 1
-  participant DB as coupons (UNIQUE milestone)
-  participant A2 as Admin calls 2..10
-  A1->>DB: read MAX = 0, so next = 1
-  A2->>DB: read MAX = 0, so next = 1
-  A1->>DB: INSERT milestone 1 (ok)
-  A2->>DB: INSERT milestone 1 (waits on A1's uncommitted row)
-  A1->>A1: COMMIT: 201
-  DB-->>A2: unique violation, ROLLBACK
-  A2->>DB: retry: MAX = 1, next = 2, 2 x 3 > 3 orders
-  A2->>A2: 409 NO_ELIGIBLE_MILESTONE
+  participant L as advisory lock
+  participant A2 as Admin call 2
+  participant A3 as Admin calls 3..10
+  A1->>L: lock (granted)
+  A2->>L: lock (waits)
+  A3->>L: lock (wait)
+  A1->>A1: MAX = 0, next = 1, INSERT, COMMIT: 201 milestone 1
+  L-->>A2: granted
+  A2->>A2: MAX = 1, next = 2, INSERT, COMMIT: 201 milestone 2
+  L-->>A3: granted, one at a time
+  A3->>A3: MAX = 2, next = 3, 9 > 6 orders: 409 NO_ELIGIBLE_MILESTONE
 ```
 
-**The database constraint, not the app code, guarantees one coupon per milestone.** The app's read-then-insert can race, and `UNIQUE(milestone)` decides the winner.
+**Two layers.** The advisory lock (a Postgres lock, so it works across app instances, released automatically at COMMIT/ROLLBACK) makes generate calls run one at a time, so each sees the previous call's coupon. `UNIQUE(milestone)` is the backstop: without the lock, duplicates are refused (as 500s) rather than created.
+
+**Why not "insert and retry on a unique violation"?** That was the first version. Review showed that with many pending milestones and many simultaneous calls, the losers kept losing and exhausted the retries: 12 calls for 12 milestones gave 3 × 201 and 9 × 500. Serializing removes the race instead of retrying it. Generation is a rare admin action, so queuing costs nothing.
 
 A stale order count is safe. Orders are never deleted, so a count that misses a just-committed order is only ever too low. That can only make us say "not yet" a moment early. It can never mint a coupon for a milestone that hasn't been reached.
 
@@ -341,7 +341,7 @@ flowchart LR
 | I2 one order per cart | cart `FOR UPDATE` + status check | `UNIQUE (orders.cart_id)` | retry storm |
 | I3 idempotent checkout | replay check first + fingerprint | `UNIQUE (orders.cart_id)` | retry storm; sequential replay |
 | I4 coupon single use | conditional `UPDATE ... AND status='AVAILABLE'` in the checkout tx | `UNIQUE (orders.coupon_id)` | `concurrency.coupons-redeem`; coupon survives failure |
-| I5 one coupon per milestone | eligibility check + retry | `UNIQUE (coupons.milestone)` | `concurrency.coupons-generate` |
+| I5 one coupon per milestone | advisory lock + eligibility check | `UNIQUE (coupons.milestone)` | `concurrency.coupons-generate` |
 | I6 totals reconcile | `money.ts` integer math | `CHECK (total = subtotal - discount)`, `CHECK (discount <= subtotal)` | `money.test`, `schema.test` |
 | I7 immutable snapshots | orders read only `orders` / `order_lines` | n/a | snapshot survives price change |
 | I8 report reconciles, never writes | one `REPEATABLE READ READ ONLY` tx | read-only transaction | `report.test` |

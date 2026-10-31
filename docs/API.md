@@ -15,7 +15,7 @@ Runnable examples for every endpoint are in [`requests.http`](../requests.http).
 
 | Code | HTTP | Meaning |
 |---|---|---|
-| `VALIDATION_ERROR` | 400 | Malformed JSON, wrong types, missing or unknown fields, bad quantity. `details.issues = [{path, message}]` for field errors |
+| `VALIDATION_ERROR` | 400 | Malformed JSON or URL, wrong types, missing or unknown fields, bad quantity, malformed product id or coupon code. `details.issues = [{path, message}]` for field errors |
 | `NOT_FOUND` | 404 | No such route |
 | `CART_NOT_FOUND` | 404 | Unknown cart id (a malformed id is also 404: it cannot name a cart) |
 | `ORDER_NOT_FOUND` | 404 | Unknown order id (malformed ids too) |
@@ -97,7 +97,8 @@ Body: `{ "quantity": integer 1..100 }`
 |---|---|
 | 400 `VALIDATION_ERROR` | body missing or malformed; `quantity` missing, not an integer, a string, < 1 or > 100 |
 | 404 `CART_NOT_FOUND` | unknown or malformed cart id |
-| 422 `PRODUCT_NOT_FOUND` | unknown product |
+| 400 `VALIDATION_ERROR` | product id not matching `^[A-Za-z0-9_-]{1,64}$` |
+| 422 `PRODUCT_NOT_FOUND` | well-formed but unknown product |
 | 409 `INSUFFICIENT_INVENTORY` | `quantity` > current stock. Advisory only: nothing is reserved |
 | 409 `CART_ALREADY_CHECKED_OUT` | cart is `CHECKED_OUT` |
 
@@ -126,7 +127,7 @@ Body (optional; may be omitted entirely):
 
 | Field | Type | Notes |
 |---|---|---|
-| `couponCode` | string ≤ 64, optional | Trimmed and upper-cased. Empty or whitespace-only means no coupon |
+| `couponCode` | string, optional | Trimmed, then must be ≤ 64 chars of letters, digits and `-` (else 400). Upper-cased for lookup. Empty or whitespace-only means no coupon |
 | `expectedTotalCents` | integer ≥ 0, optional | The total the client showed the customer. If the computed total (after discount) differs: 409 `PRICE_CHANGED` |
 
 Unknown fields are rejected (400), so a misspelt `coupon` can't silently check out at full price.
@@ -238,12 +239,13 @@ Example: the state at the end of `requests.http`.
 ## Where the code and CLAUDE.md differ (or CLAUDE.md is silent)
 
 1. **`NOT_FOUND` (404)** for unknown routes is an extra code, not in the CLAUDE.md table.
-2. **Fastify's own client errors** (malformed or empty JSON body, unsupported content type, body too large) are all mapped to **400 `VALIDATION_ERROR`**, including cases that would normally be 413/415.
+2. **Fastify's own client errors** (malformed or empty JSON body, unsupported content type, body too large, invalid URL encoding) are all mapped to **400 `VALIDATION_ERROR`**, including cases that would normally be 413/415. Router errors go through `frameworkErrors` so they use the same shape.
 3. **Unknown fields in the checkout body are rejected (400).** CLAUDE.md doesn't say. Chosen so a typo can't silently drop a coupon.
 4. **An empty or whitespace-only `couponCode`** is treated as "no coupon" (fingerprint `null`), not as an unknown code.
 5. **Malformed UUIDs** for carts and orders return 404 (the TASKS.md spec), not 400.
 6. **`itemCount`** is total units. CLAUDE.md doesn't define it.
 7. **`DELETE` with an unknown product** returns 200 (idempotent delete), not 422 `PRODUCT_NOT_FOUND`.
 8. **Extra DB constraints** beyond CLAUDE.md: `carts_checked_out_at_matches_status` and `orders_coupon_snapshot_complete` (coupon id, code and percent are all set or all null).
-9. **Coupon-generation retry is bounded at 3 attempts.** With ≥ 3 pending milestones and ≥ 4 simultaneous admin calls, one call can lose three races and surface the unique violation as a 500. Not reachable in normal use; noted as deferred.
-10. **Stack:** Vitest is pinned to v3, because Vitest 4+ requires Node 22, while CLAUDE.md promises Node 20+.
+9. **Coupon generation is serialized** with a Postgres advisory lock, not CLAUDE.md's "retry on unique violation". Review found the bounded retry produced 500s under concurrent admin calls (see docs/FLOWS.md §9).
+10. **Malformed product ids and coupon codes are 400**, not 422 `PRODUCT_NOT_FOUND` / `COUPON_NOT_FOUND`. They are rejected before any lookup, which keeps odd bytes (e.g. NUL, invalid in Postgres text) away from SQL.
+11. **Stack:** Vitest is pinned to v3, because Vitest 4+ requires Node 22, while CLAUDE.md promises Node 20+.

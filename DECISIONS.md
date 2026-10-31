@@ -29,7 +29,7 @@ Each invariant is enforced twice: once by application logic (so the client gets 
 | I2 | A cart produces at most one order | `checkout` step 1: cart `SELECT ... FOR UPDATE`, status check | `orders_cart_id_unique` | "retry storm"; `schema.test.ts` |
 | I3 | A retried checkout (same payload) returns the original order; no second order, no second decrement | `checkout` step 1 → `replayExistingOrder` (fingerprint compare), before any stock check | `orders_cart_id_unique` | "retry storm"; `checkout.test.ts` "sequential replay ... decrements stock once" |
 | I4 | A coupon is REDEEMED iff attached to a committed order; failed checkouts never consume one | `claimCoupon`: single conditional `UPDATE ... WHERE status='AVAILABLE'` inside the checkout transaction | `orders_coupon_id_unique`, `coupons_redeemed_at_matches_status`, `orders_coupon_snapshot_complete` | `concurrency.coupons-redeem.test.ts`; `coupons.redeem.test.ts` "fails on stock / PRICE_CHANGED does not consume the coupon" |
-| I5 | At most one coupon per milestone; coupons ≤ floor(orders / n) | `couponService.generateCoupon`: eligibility check, retry on unique violation | `coupons_milestone_unique` | `concurrency.coupons-generate.test.ts`; `coupons.generate.test.ts` |
+| I5 | At most one coupon per milestone; coupons ≤ floor(orders / n) | `couponService.generateCoupon`: `pg_advisory_xact_lock` serializes calls, then an eligibility check | `coupons_milestone_unique` | `concurrency.coupons-generate.test.ts`; `coupons.generate.test.ts` |
 | I6 | `line_total = unit_price × qty`, `subtotal = Σ lines`, `0 ≤ discount ≤ subtotal`, `total = subtotal − discount ≥ 0` | `money.ts` (`lineTotal`, `sumCents`, `percentDiscount`) | `order_lines_line_total_matches`, `orders_total_is_subtotal_minus_discount`, `orders_discount_within_subtotal`, `orders_*_nonnegative` | `money.test.ts` (incl. 5,000 generated subtotals); `schema.test.ts`; "100% coupon → total 0" |
 | I7 | Placed orders are immutable snapshots, never read live product data | `checkoutService.loadOrder` reads only `orders` + `order_lines`; no code path updates an order | n/a (no UPDATE path exists) | `checkout.test.ts` "keeps its snapshot after the product price and name change"; report test renames a product |
 | I8 | Every report figure is recomputable from orders and coupons; reading never writes | `reportService.getReport`: one `REPEATABLE READ, READ ONLY` transaction, no stored aggregates | read-only transaction | `report.test.ts` "reconciles with ... the API returned", "is read-only" |
@@ -45,6 +45,9 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 | Products locked in cart-add order instead of by id | 30-cart opposite-order test | deadlocks (40P01) surface as 500s |
 | Coupon claim as `SELECT` then unconditional `UPDATE` | coupon redeem race, all 5 rounds | `[201, 500]` instead of `[201, 409]`: only the `UNIQUE(coupon_id)` backstop saved the data |
 | Coupon generation retry disabled | coupon generation race | *the first version of the test still passed*: a plain `Promise.all` never made the short transactions collide. Fixed the test with `raceBehindTableLock`; now both tests fail without the retry |
+| (after review) Advisory lock removed from generation | all 3 generation race tests | `[201, 500, ...]`: concurrent calls compute the same milestone and the backstop refuses them |
+| (after review) `ORDER BY id` deleted from the products lock | **none: survives** | on a 6-row table every seq scan locks in the same physical order, so the sort can't be told apart from no sort. The sort is a guarantee that doesn't depend on the plan; the test catches the realistic bug (locking in cart order) |
+| (after review) `expectedTotalCents` added to the fingerprint | `checkout.test.ts` replay with a different expectedTotalCents | 409 instead of a 200 replay |
 | Dropped `CHECK (stock >= 0)` | none in the concurrency suite (expected) | locks alone prevent oversell; the constraint is a backstop |
 
 ---
@@ -88,7 +91,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Choice:** Pessimistic locks, `READ COMMITTED`, lock order cart → products (id ascending) → coupon. Coupon claim by conditional UPDATE. DB constraints as a backstop.
 
-**Why:** *(rewrite in my own words)* Contention is on a few hot rows and the transaction is short, so waiting is cheaper than abort-and-retry. Locking the rows up front lets me report **all** shortfalls with exact `available` numbers in one response; per-line conditional decrements fail on the first short line. Optimistic and SERIALIZABLE both push retry loops into the request path and turn contention into wasted work. An in-process mutex breaks the moment there are two instances. The fixed lock order removes deadlocks, and the test with opposite-ordered carts proves it.
+**Why:** *(rewrite in my own words)* Contention is on a few hot rows and the transaction is short, so waiting is cheaper than abort-and-retry. Locking the rows up front lets me report **all** shortfalls with exact `available` numbers in one response; per-line conditional decrements fail on the first short line. Optimistic and SERIALIZABLE both push retry loops into the request path and turn contention into wasted work. An in-process mutex breaks the moment there are two instances. The fixed lock order removes deadlocks. The test with opposite-ordered carts catches the realistic bug (locking in cart order); see the mutation table for what it can't distinguish.
 
 **Consequences:** Checkouts of the same product serialize: throughput on one very hot SKU is bounded by transaction latency (see §8). No retry logic is needed in checkout. The rules are easy to verify by reading the SQL, which is why there is no ORM.
 
@@ -185,11 +188,11 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 - Generate all pending milestones in one call.
 - Generate automatically inside checkout when an order crosses a milestone.
 
-**Choice:** One per call. `UNIQUE(milestone)` decides races; the loser retries the whole transaction (up to 3 attempts) and may get the next milestone or a 409.
+**Choice:** One per call. Calls are serialized with a transaction-scoped Postgres advisory lock, so each sees the previous call's coupon; `UNIQUE(milestone)` is the backstop.
 
-**Why:** *(rewrite)* Matches the brief's wording ("an administrator can request coupon generation"). One call, one resource keeps the 201 response simple. Generating inside checkout would add a write and contention to the hot path, and couple a customer's request to an admin concern. The constraint, not app code, guarantees one per milestone.
+**Why:** *(rewrite)* Matches the brief's wording ("an administrator can request coupon generation"). One call, one resource keeps the 201 response simple. Generating inside checkout would add a write and contention to the hot path, and couple a customer's request to an admin concern. The first version used "insert, retry on unique violation (3 attempts)"; review showed that 12 simultaneous calls for 12 pending milestones gave 3 × 201 and 9 × 500, because losers kept losing. Serializing removes the race rather than retrying it, and for a rare admin action the queuing costs nothing. The advisory lock lives in Postgres, so it still works with several app instances.
 
-**Consequences:** Catching up on k pending milestones takes k calls. The retry is bounded: with ≥ 3 pending milestones and ≥ 4 simultaneous admin calls, one call could lose three races and get a 500 (documented, deferred).
+**Consequences:** Catching up on k pending milestones takes k calls (or k simultaneous calls, which now each get one). Generation runs one at a time, which is irrelevant for an admin action. A code collision (`SAVE-` plus 8 of 32 symbols, about 10^12 codes) would surface as a 500; it is not retried.
 
 ### Decision 9: Postgres with hand-written SQL, no ORM
 
@@ -226,7 +229,7 @@ Each lock or conditional was removed on purpose, to confirm a test fails without
 
 **Cart edits** take the same cart row lock and check `status = 'OPEN'` in the same transaction, so an edit is either fully before a checkout (the order includes it) or fully after (409).
 
-**Coupon generation:** read the order count and `MAX(milestone)`, insert milestone + 1; on a 23505 (`coupons_milestone_unique` or `coupons_code_unique`) retry the whole transaction, up to 3 attempts. A stale order count can only under-generate, never over-generate (orders are never deleted).
+**Coupon generation:** `SELECT pg_advisory_xact_lock(...)` first, so generate calls run one at a time across all instances; then read the order count and `MAX(milestone)`, and insert milestone + 1. `UNIQUE(milestone)` is the backstop. A stale order count can only under-generate, never over-generate (orders are never deleted).
 
 **Report:** `REPEATABLE READ, READ ONLY`, one snapshot.
 
@@ -278,14 +281,17 @@ One shape everywhere: `{ "error": { "code", "message", "details?" } }`. Clients 
 
 ## 7. Implemented vs deferred
 
-**Implemented:** products; carts (create, view, set quantity, remove) with live pricing and stock warnings; atomic, idempotent checkout with order snapshots and all-shortfall reporting; `expectedTotalCents` guard; milestone coupon generation safe under concurrency; single-use coupon redemption inside checkout; read-only reconciling report; uniform error model; config validation; 87 tests (3 concurrency files) on a real DB; API docs, REST Client walkthrough, race demo, flow diagrams.
+**Implemented:** products; carts (create, view, set quantity, remove) with live pricing and stock warnings; atomic, idempotent checkout with order snapshots and all-shortfall reporting; `expectedTotalCents` guard; milestone coupon generation safe under concurrency; single-use coupon redemption inside checkout; read-only reconciling report; uniform error model; config validation; 99 tests (3 concurrency files) on a real DB; API docs, REST Client walkthrough, race demo, flow diagrams.
 
 **Deferred, deliberately:**
 - Authentication / authorization (admin routes are only marked by the `/admin` prefix).
 - Payment and a payment saga (Decision 5).
 - Stock reservation with expiry (Decision 3).
 - A general `Idempotency-Key` store for non-checkout POSTs (Decision 2).
-- Unbounded generation retry: the 3-attempt limit can surface a 500 under extreme admin concurrency (Decision 8).
+- Lock and statement timeouts (`lock_timeout`, `statement_timeout`, pool `connectionTimeoutMillis`): today a stuck transaction holding a hot product row would block that product's checkouts indefinitely.
+- `FOR NO KEY UPDATE` instead of `FOR UPDATE` on products: enough for a stock update, and it would not conflict with the `FOR KEY SHARE` taken by the `cart_items` foreign-key check.
+- `orders.request_fingerprint` should be `NOT NULL` (the code always sets it).
+- A concurrent test for the report's snapshot (checkouts committing during repeated reports). Today, dropping `REPEATABLE READ` would not fail a test.
 - Product management endpoints (prices and stock change only via SQL/seed).
 - Pagination on `GET /admin/coupons`, `GET /products`.
 - Rate limiting, request ids / structured audit log, metrics.
