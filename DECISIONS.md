@@ -1,6 +1,6 @@
 # DECISIONS.md
 
-> DRAFT. Factual sections are generated from the code. Every **Why** must be rewritten in my own words before submission. Remaining `TODO(me)` markers are mine to write.
+> DRAFT. Factual sections are generated from the code. Sections marked `REVIEW(me)` hold draft pointers to confirm and rewrite, and every **Why** must be in my own words. Remove this banner before submitting.
 
 Contents
 1. [System invariants](#1-system-invariants)
@@ -298,35 +298,68 @@ One shape everywhere: `{ "error": { "code", "message", "details?" } }`. Clients 
 - Multi-currency (everything is USD).
 - Cart expiry / cleanup of abandoned carts.
 
-`TODO(me)`: confirm this list and add anything I consciously skipped.
+`REVIEW(me)`: confirm this list and add anything else I consciously skipped.
 
 ---
 
 ## 8. Multiple instances and production scale
 
-`TODO(me)`: write this section myself. Points to cover:
-- the app is stateless; all locking already lives in Postgres, so N instances behind a load balancer need no change
-- hot-product row contention (one SKU serializes its checkouts) and mitigations: reservations, a queue-based checkout per SKU, split/sharded stock counters
-- a payment saga: order `PENDING`, an outbox, charge outside the transaction, compensation on failure
-- an `Idempotency-Key` store with a TTL for non-cart operations
-- read replicas or materialized aggregates for reporting
-- event-driven coupon generation (an order-placed event, instead of an admin poll)
-- connection pool sizing (instances × pool size ≤ Postgres `max_connections`; use PgBouncer in transaction mode, which is compatible with this design since no session state is used)
+`REVIEW(me)`: draft pointers. Rewrite in my own words.
+
+**What already works with N instances.** The app holds no state: no in-process locks, maps or caches. Every coordination point is in Postgres: row locks (`FOR UPDATE`), the conditional coupon `UPDATE`, the generation advisory lock, and `UNIQUE`/`CHECK` constraints. Two instances behind a load balancer behave exactly like one, because two requests on different instances meet at the same rows. The concurrency tests already exercise this: every request runs on its own pooled connection, just as separate instances would.
+
+**What breaks or degrades first at scale, and what I'd do:**
+
+- **Hot-SKU contention.** Every checkout containing a given product queues on that product's row lock, so one popular SKU's throughput is about 1 / (checkout transaction time).
+  - Keep the transaction short (it already does no network I/O besides SQL).
+  - Use `FOR NO KEY UPDATE` instead of `FOR UPDATE`.
+  - For flash sales: stock reservations with a TTL taken at add-to-cart, a per-SKU queue (single consumer) for checkout, or stock split into N bucket rows that a checkout picks from.
+- **Payment.** It must never run inside the transaction holding these locks. Use a saga instead:
+  1. Commit the order as `PENDING` with stock and coupon held, plus an outbox row.
+  2. A worker charges the gateway with an idempotency key (the order id).
+  3. On success, mark the order `PLACED`. On failure, a compensating transaction releases stock and the coupon.
+  - Milestones and the report would then count only `PLACED` orders.
+- **Idempotency beyond checkout.** Add an `Idempotency-Key` header with a table of (key, request hash, response, expires_at) for `POST /carts`, `POST /admin/coupons` and future payment calls. Checkout keeps using the cart id.
+- **Timeouts.** Set `lock_timeout` and `statement_timeout`, and a pool `connectionTimeoutMillis`, so a stuck transaction fails fast (mapped to a 503 or 409) instead of piling up waiters.
+- **Connection pool sizing.** Keep instances × pool size within Postgres `max_connections`, and put PgBouncer in front in **transaction** mode. That is compatible with this design: no session state is used, and the advisory lock is transaction-scoped (`pg_advisory_xact_lock`), not session-scoped.
+- **Reporting.** The on-demand report scans every order. At scale, run it on a read replica (accepting slight lag), or keep incrementally updated aggregates written by the same transaction or an outbox consumer, reconciled periodically against the source tables.
+- **Coupon generation.** Could become event-driven: an `order placed` event triggers generation when a milestone is crossed, instead of an admin call. The advisory lock and `UNIQUE(milestone)` stay as they are.
+- **Observability.** Add request ids, structured logs of every 409/422 by code, and metrics for lock wait time and checkout latency per SKU.
 
 ---
 
 ## 9. How I used AI tools
 
-`TODO(me)`: write from AI_LOG.md, in my own words. Must include at least one concrete correction, rejection or redirect.
+`REVIEW(me)`: the pointers below are what happened in this project. Rewrite them in my own words, keep the parts I agree with, and add my own corrections from AI_LOG.md.
+
+- **Setup.** I wrote CLAUDE.md first: stack, invariants I1–I8, non-negotiable rules (one transaction, fixed lock order, conditional coupon claim, no in-process locks) and testing rules. I then drove Claude Code task by task from TASKS.md. Each task ended with typecheck plus the full test suite against a real Postgres.
+- **Verification by mutation, not by trust.** For each concurrency guarantee, the guard was removed on purpose to confirm a test fails (table in §1). This is how the next point was found.
+- **Correction 1: a test that proved nothing.** The first coupon-generation race test (10 calls with `Promise.all`) still passed with the retry logic disabled. The transactions were so short that the calls never actually overlapped. The **test** was fixed, not the code: `raceBehindTableLock` holds a table lock until every request has done its reads, so they collide for real. Lesson: a concurrency test must be shown to fail against a broken implementation.
+- **Correction 2: a design that failed under load.** The generation design from my own plan (insert, retry up to 3 times on a unique violation) was reviewed adversarially by a separate AI agent that read the code with no context from the build. It reproduced 12 simultaneous calls for 12 pending milestones giving 3 × 201 and 9 × 500. I replaced the retry with a Postgres advisory lock that serializes generation, and added that scenario as a test.
+- **Correction 3: an overstated claim in my docs.** The docs said the opposite-order test proves products must be locked sorted by id. Review showed that deleting `ORDER BY id` still passes, because a 6-row table is always scanned in the same physical order. I corrected the docs and kept the sort as a plan-independent guarantee.
+- **Smaller ones:**
+  - A clever connection-error heuristic in `withTransaction` that would have misclassified app errors was replaced with "destroy the client only if ROLLBACK fails".
+  - The latest Vitest required Node 22, against the stated Node 20+, so I pinned v3 rather than silently change the stack.
+  - Inputs with NUL bytes reached Postgres and returned 500s; I added format validation.
+- **What I did not delegate:** the reasoning in this document, the choice of semantics in §2, and reviewing every diff. `REVIEW(me)`: say how I reviewed in practice.
 
 ---
 
 ## 10. What I would examine first with two more hours
 
-`TODO(me)`
+`REVIEW(me)`: draft pointers. Reorder by what I actually think is riskiest.
+
+1. **Timeouts and failure under a stuck transaction.** Add `lock_timeout` and `statement_timeout`, map timeouts to a documented code, and test that a checkout blocked behind a hung transaction fails cleanly instead of hanging.
+2. **Randomized concurrency testing.** Fire random interleavings of add, edit, delete, checkout, retry, generate and redeem across many carts. After each run, assert I1–I8 from the database alone: stock + sold = initial, one order per cart, `REDEEMED` iff attached, coupons ≤ floor(orders / n), totals reconcile.
+3. **A test that the report uses one snapshot.** Run checkouts concurrently with repeated reports and assert each report is internally consistent (Σ product gross = gross revenue). Today, dropping `REPEATABLE READ` would not fail a test.
+4. **Hot-SKU load test.** Measure checkout throughput and p99 latency on one product under 50–100 concurrent clients, and compare `FOR UPDATE` with `FOR NO KEY UPDATE`.
+5. **Payment saga sketch.** Add a `PENDING` order state and an outbox table, to check how much of the checkout code survives. This is the biggest design change still deferred.
+6. **Small schema tightening.** Make `request_fingerprint` `NOT NULL`. Consider a trigger so `orders` and `order_lines` cannot be updated, making I7 a database guarantee rather than "no code path does it".
 
 ---
 
 ## 11. Time spent
 
-`TODO(me)`: approximately __ hours. State anything incomplete honestly.
+`REVIEW(me)`: the commit history runs from 13:53 to 15:58 on the build day: about 2 hours of AI-assisted implementation, tests and docs. Add my own time for reading the brief, setting up, reviewing diffs, writing this document and rehearsing. Then state the total (approximately __ hours).
+
+Incomplete or deferred, stated honestly: see §7. Nothing listed in the assignment's required deliverables is missing.
