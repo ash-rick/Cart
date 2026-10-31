@@ -127,4 +127,27 @@ describe('concurrent checkout', () => {
       expect(rows[0]!.quantity).toBe(orderedQty);
     }
   });
+
+  // Same as above for DELETE: the removed line is either absent from the order (delete
+  // first) or the delete is refused (checkout first). Never "deleted but still ordered".
+  it('delete vs checkout race always has a consistent outcome (x10)', async () => {
+    for (let round = 0; round < 10; round++) {
+      const cartId = await cartWith(app, { sku_tee: 1, sku_mug: 1 });
+
+      const [del, co] = await Promise.all([
+        app.inject({ method: 'DELETE', url: `/carts/${cartId}/items/sku_mug` }),
+        checkout(app, cartId),
+      ]);
+
+      expect(co.statusCode).toBe(201);
+      const ordered = co.json().lines.map((l: { productId: string }) => l.productId);
+      if (del.statusCode === 200) {
+        expect(ordered).toEqual(['sku_tee']);
+      } else {
+        expect(del.statusCode).toBe(409);
+        expect(del.json().error.code).toBe('CART_ALREADY_CHECKED_OUT');
+        expect(ordered).toEqual(['sku_mug', 'sku_tee']);
+      }
+    }
+  });
 });

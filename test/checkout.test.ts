@@ -135,6 +135,18 @@ describe('checkout and orders', () => {
     expect(await stockOf('sku_print')).toBe(0);
   });
 
+  it('expectedTotalCents is not part of the fingerprint: a replay with a different one is still a replay', async () => {
+    const cartId = await cartWith(app, { sku_mug: 1 });
+    const first = await checkout(app, cartId, { expectedTotalCents: 1299 });
+    expect(first.statusCode).toBe(201);
+
+    for (const body of [{}, { expectedTotalCents: 1 }]) {
+      const replay = await checkout(app, cartId, body);
+      expect(replay.statusCode).toBe(200);
+      expect(replay.json().id).toBe(first.json().id);
+    }
+  });
+
   it('stock is decremented exactly once across a replay', async () => {
     const cartId = await cartWith(app, { sku_print: 2 });
     await checkout(app, cartId);

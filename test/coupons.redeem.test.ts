@@ -123,6 +123,19 @@ describe('coupon redemption at checkout (n = 3, x = 10)', () => {
     expect(different.json().error.code).toBe('CART_ALREADY_CHECKED_OUT');
   });
 
+  it('the discount uses the percent snapshotted on the coupon, not the current config', async () => {
+    const code = await issueCoupon(app); // generated at 10%
+    await app.close();
+    app = await makeApp({ couponEveryNOrders: 3, couponPercent: 50 });
+
+    const res = await checkout(app, await cartWith(app, { sku_tee: 1 }), { couponCode: code });
+    expect(res.json()).toMatchObject({
+      subtotalCents: 2500,
+      discount: { percent: 10, amountCents: 250 },
+      totalCents: 2250,
+    });
+  });
+
   it('a 100% coupon makes the total 0, never negative', async () => {
     await app.close();
     app = await makeApp({ couponEveryNOrders: 3, couponPercent: 100 });
