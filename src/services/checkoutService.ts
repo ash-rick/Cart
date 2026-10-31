@@ -1,6 +1,6 @@
 import { withTransaction, type DbClient, type Pool } from '../db';
 import { errors, type Shortfall } from '../errors';
-import { lineTotal, sumCents } from '../money';
+import { lineTotal, percentDiscount, sumCents } from '../money';
 import { assertCartId, isUuid } from './cartService';
 
 export interface CheckoutInput {
@@ -118,9 +118,10 @@ export async function checkout(pool: Pool, input: CheckoutInput): Promise<Checko
     if (shortfalls.length > 0) throw errors.insufficientInventory(shortfalls);
     const subtotalCents = sumCents(lines.map((l) => l.lineTotalCents));
 
-    // STEP 5: coupon claim (Task 8)
-    if (couponCode !== null) throw errors.couponNotFound(couponCode);
-    const discountCents = 0;
+    // STEP 5: claim the coupon (last lock in the fixed order). Rolled back with everything
+    // else if any later step fails, so a failed checkout never consumes it.
+    const coupon = couponCode === null ? null : await claimCoupon(client, couponCode);
+    const discountCents = coupon ? percentDiscount(subtotalCents, coupon.percent) : 0;
     const totalCents = subtotalCents - discountCents;
 
     // STEP 6: the client may pin the total it saw; refuse to charge anything else.
@@ -136,10 +137,20 @@ export async function checkout(pool: Pool, input: CheckoutInput): Promise<Checko
 
     // STEP 7: write the order snapshot, decrement stock, close the cart.
     const orderRes = await client.query<{ id: string }>(
-      `INSERT INTO orders (cart_id, subtotal_cents, discount_cents, total_cents, request_fingerprint)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO orders (cart_id, subtotal_cents, discount_cents, total_cents,
+                           coupon_id, coupon_code, discount_percent, request_fingerprint)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id`,
-      [input.cartId, subtotalCents, discountCents, totalCents, fingerprint],
+      [
+        input.cartId,
+        subtotalCents,
+        discountCents,
+        totalCents,
+        coupon?.id ?? null,
+        coupon?.code ?? null,
+        coupon?.percent ?? null,
+        fingerprint,
+      ],
     );
     const orderId = orderRes.rows[0]!.id;
 
@@ -175,6 +186,33 @@ export async function checkout(pool: Pool, input: CheckoutInput): Promise<Checko
     // STEP 8: commit happens in withTransaction when this returns.
     return { order: await loadOrder(client, orderId), replayed: false };
   });
+}
+
+/**
+ * Claims a coupon with one conditional UPDATE: the status check and the write are a
+ * single atomic statement, never a read followed by a separate write.
+ *
+ * Two checkouts claiming the same code: the first UPDATE locks the coupon row; the second
+ * waits on that lock. If the first commits, the second re-evaluates `status = 'AVAILABLE'`
+ * against the committed row, matches nothing, and gets COUPON_ALREADY_REDEEMED. If the
+ * first rolls back, the second claims the coupon.
+ */
+async function claimCoupon(
+  client: DbClient,
+  code: string,
+): Promise<{ id: string; code: string; percent: number }> {
+  const claimed = await client.query<{ id: string; code: string; percent: number }>(
+    `UPDATE coupons SET status = 'REDEEMED', redeemed_at = now()
+      WHERE code = $1 AND status = 'AVAILABLE'
+      RETURNING id, code, percent`,
+    [code],
+  );
+  if (claimed.rows[0]) return claimed.rows[0];
+
+  // Nothing claimed: only now find out why, to pick the right error.
+  const existing = await client.query(`SELECT 1 FROM coupons WHERE code = $1`, [code]);
+  if (existing.rowCount === 0) throw errors.couponNotFound(code);
+  throw errors.couponAlreadyRedeemed(code);
 }
 
 async function replayExistingOrder(

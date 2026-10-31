@@ -81,6 +81,24 @@ export function generateCoupon(app: FastifyInstance) {
   return app.inject({ method: 'POST', url: '/admin/coupons' });
 }
 
+/** Places enough orders to reach the next milestone, then generates its coupon code. */
+export async function issueCoupon(app: FastifyInstance): Promise<string> {
+  const ordersPlaced = await countRows('orders');
+  const n = app.config.couponEveryNOrders;
+  const nextMilestone = (await countRows('coupons')) + 1;
+  await placeOrders(app, Math.max(nextMilestone * n - ordersPlaced, 0));
+  const res = await generateCoupon(app);
+  if (res.statusCode !== 201) throw new Error(`issueCoupon failed: ${res.statusCode} ${res.body}`);
+  return res.json().code;
+}
+
+export async function couponStatus(code: string): Promise<string> {
+  const { rows } = await db().query<{ status: string }>(`SELECT status FROM coupons WHERE code = $1`, [
+    code,
+  ]);
+  return rows[0]!.status;
+}
+
 /**
  * Forces a race. Holds SHARE ROW EXCLUSIVE on `table` (reads pass, INSERT/UPDATE block),
  * starts `fire()`, waits until `waiters` statements are queued on that lock, then
