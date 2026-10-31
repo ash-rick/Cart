@@ -3,7 +3,9 @@ import { ZodError } from 'zod';
 import { loadConfig, type Config } from './config';
 import { createPool, type Pool } from './db';
 import { AppError, errorBody, errors } from './errors';
+import { cartRoutes } from './routes/carts';
 import { healthRoutes } from './routes/health';
+import { productRoutes } from './routes/products';
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -30,6 +32,8 @@ export async function buildApp(configOverrides: Partial<Config> = {}): Promise<F
 
   registerErrorHandling(app);
   await app.register(healthRoutes);
+  await app.register(productRoutes);
+  await app.register(cartRoutes);
   return app;
 }
 

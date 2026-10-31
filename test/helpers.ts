@@ -35,6 +35,40 @@ export async function makeApp(overrides: Partial<Config> = {}): Promise<FastifyI
   return buildApp({ databaseUrl: testDatabaseUrl, ...overrides });
 }
 
+export async function createCart(app: FastifyInstance): Promise<string> {
+  const res = await app.inject({ method: 'POST', url: '/carts' });
+  if (res.statusCode !== 201) throw new Error(`createCart failed: ${res.statusCode} ${res.body}`);
+  return res.json().id;
+}
+
+export function putItem(app: FastifyInstance, cartId: string, productId: string, quantity: unknown) {
+  return app.inject({
+    method: 'PUT',
+    url: `/carts/${cartId}/items/${productId}`,
+    payload: { quantity },
+  });
+}
+
+/** Creates a cart holding the given items and returns its id. */
+export async function cartWith(
+  app: FastifyInstance,
+  items: Record<string, number>,
+): Promise<string> {
+  const cartId = await createCart(app);
+  for (const [productId, quantity] of Object.entries(items)) {
+    const res = await putItem(app, cartId, productId, quantity);
+    if (res.statusCode !== 200) throw new Error(`putItem failed: ${res.statusCode} ${res.body}`);
+  }
+  return cartId;
+}
+
+export async function stockOf(productId: string): Promise<number> {
+  const { rows } = await db().query<{ stock: number }>(`SELECT stock FROM products WHERE id = $1`, [
+    productId,
+  ]);
+  return rows[0]!.stock;
+}
+
 export async function closeDb(): Promise<void> {
   await pool?.end();
   pool = undefined;
