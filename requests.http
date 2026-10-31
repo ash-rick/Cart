@@ -1,0 +1,256 @@
+# Executable walkthrough for the VS Code REST Client extension (humao.rest-client).
+# Run top to bottom against a FRESH dev DB with the default config (n = 5, x = 10):
+#   npm run db:reset && npm run dev
+# Ids chain automatically through named requests.
+
+@base = http://localhost:3000
+
+### Health
+GET {{base}}/health
+
+### List products (prices are integer cents)
+GET {{base}}/products
+
+# ---------------------------------------------------------------------------
+# Cart lifecycle
+# ---------------------------------------------------------------------------
+
+### Create a cart -> 201
+# @name cart
+POST {{base}}/carts
+
+@cartId = {{cart.response.body.id}}
+
+### Add 2 mugs (PUT sets the absolute quantity, so retrying it is harmless)
+PUT {{base}}/carts/{{cartId}}/items/sku_mug
+Content-Type: application/json
+
+{ "quantity": 2 }
+
+### Add 3 sticker packs
+PUT {{base}}/carts/{{cartId}}/items/sku_sticker
+Content-Type: application/json
+
+{ "quantity": 3 }
+
+### Change stickers to 1
+PUT {{base}}/carts/{{cartId}}/items/sku_sticker
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+### Remove stickers (DELETE is idempotent: run it twice, both 200)
+DELETE {{base}}/carts/{{cartId}}/items/sku_sticker
+
+### Add a tee -> cart is 2 x 1299 + 1 x 2500 = 5098
+PUT {{base}}/carts/{{cartId}}/items/sku_tee
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+### View the cart (live prices, subtotal, warnings)
+GET {{base}}/carts/{{cartId}}
+
+# ---------------------------------------------------------------------------
+# Validation errors
+# ---------------------------------------------------------------------------
+
+### Quantity 0 -> 400 VALIDATION_ERROR
+PUT {{base}}/carts/{{cartId}}/items/sku_mug
+Content-Type: application/json
+
+{ "quantity": 0 }
+
+### Unknown product -> 422 PRODUCT_NOT_FOUND
+PUT {{base}}/carts/{{cartId}}/items/sku_nope
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+### More than current stock -> 409 INSUFFICIENT_INVENTORY (advisory check at add time)
+PUT {{base}}/carts/{{cartId}}/items/sku_print
+Content-Type: application/json
+
+{ "quantity": 4 }
+
+### Malformed JSON -> 400 VALIDATION_ERROR
+PUT {{base}}/carts/{{cartId}}/items/sku_mug
+Content-Type: application/json
+
+{bad
+
+# ---------------------------------------------------------------------------
+# Checkout
+# ---------------------------------------------------------------------------
+
+### Checkout with a stale expected total -> 409 PRICE_CHANGED, nothing changes
+POST {{base}}/carts/{{cartId}}/checkout
+Content-Type: application/json
+
+{ "expectedTotalCents": 5000 }
+
+### Checkout with the total the client saw -> 201 order
+# @name order
+POST {{base}}/carts/{{cartId}}/checkout
+Content-Type: application/json
+
+{ "expectedTotalCents": 5098 }
+
+@orderId = {{order.response.body.id}}
+
+### Retry the same checkout -> 200, same order, header Idempotent-Replayed: true
+POST {{base}}/carts/{{cartId}}/checkout
+Content-Type: application/json
+
+{ "expectedTotalCents": 5098 }
+
+### Retry with a different payload (a coupon) -> 409 CART_ALREADY_CHECKED_OUT
+POST {{base}}/carts/{{cartId}}/checkout
+Content-Type: application/json
+
+{ "couponCode": "SAVE-WHATEVER" }
+
+### Edit a checked-out cart -> 409 CART_ALREADY_CHECKED_OUT
+PUT {{base}}/carts/{{cartId}}/items/sku_mug
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+### Get the order (snapshot: never reads live product data)
+GET {{base}}/orders/{{orderId}}
+
+# ---------------------------------------------------------------------------
+# INSUFFICIENT_INVENTORY at checkout: cart A holds all 3 prints, cart B buys one first
+# ---------------------------------------------------------------------------
+
+### Cart A
+# @name cartA
+POST {{base}}/carts
+
+### Cart A: 3 prints
+PUT {{base}}/carts/{{cartA.response.body.id}}/items/sku_print
+Content-Type: application/json
+
+{ "quantity": 3 }
+
+### Cart B
+# @name cartB
+POST {{base}}/carts
+
+### Cart B: 1 print
+PUT {{base}}/carts/{{cartB.response.body.id}}/items/sku_print
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+### Cart B checks out first -> 201 (order 2)
+POST {{base}}/carts/{{cartB.response.body.id}}/checkout
+
+### Cart A now shows a warning (wants 3, 2 available)
+GET {{base}}/carts/{{cartA.response.body.id}}
+
+### Cart A checkout -> 409 INSUFFICIENT_INVENTORY, details.items lists the shortfall
+POST {{base}}/carts/{{cartA.response.body.id}}/checkout
+
+# ---------------------------------------------------------------------------
+# Coupons: milestone 1 needs 5 placed orders; we have 2
+# ---------------------------------------------------------------------------
+
+### Generate too early -> 409 NO_ELIGIBLE_MILESTONE with progress details
+POST {{base}}/admin/coupons
+
+### Order 3
+# @name c3
+POST {{base}}/carts
+
+###
+PUT {{base}}/carts/{{c3.response.body.id}}/items/sku_sticker
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+###
+POST {{base}}/carts/{{c3.response.body.id}}/checkout
+
+### Order 4
+# @name c4
+POST {{base}}/carts
+
+###
+PUT {{base}}/carts/{{c4.response.body.id}}/items/sku_sticker
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+###
+POST {{base}}/carts/{{c4.response.body.id}}/checkout
+
+### Order 5
+# @name c5
+POST {{base}}/carts
+
+###
+PUT {{base}}/carts/{{c5.response.body.id}}/items/sku_sticker
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+###
+POST {{base}}/carts/{{c5.response.body.id}}/checkout
+
+### Generate -> 201, milestone 1, 10%
+# @name coupon
+POST {{base}}/admin/coupons
+
+@couponCode = {{coupon.response.body.code}}
+
+### Generate again -> 409 (milestone 2 needs 10 orders)
+POST {{base}}/admin/coupons
+
+### Redeem: a hoodie (5999) with the coupon -> discount floor(599.9) = 599, total 5400
+# @name hoodieCart
+POST {{base}}/carts
+
+###
+PUT {{base}}/carts/{{hoodieCart.response.body.id}}/items/sku_hoodie
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+### Checkout with the coupon (codes are case-insensitive) -> 201
+POST {{base}}/carts/{{hoodieCart.response.body.id}}/checkout
+Content-Type: application/json
+
+{ "couponCode": "{{couponCode}}", "expectedTotalCents": 5400 }
+
+### Try the same coupon on another cart -> 409 COUPON_ALREADY_REDEEMED
+# @name capCart
+POST {{base}}/carts
+
+###
+PUT {{base}}/carts/{{capCart.response.body.id}}/items/sku_cap
+Content-Type: application/json
+
+{ "quantity": 1 }
+
+###
+POST {{base}}/carts/{{capCart.response.body.id}}/checkout
+Content-Type: application/json
+
+{ "couponCode": "{{couponCode}}" }
+
+### Unknown coupon -> 422 COUPON_NOT_FOUND (the cart stays OPEN)
+POST {{base}}/carts/{{capCart.response.body.id}}/checkout
+Content-Type: application/json
+
+{ "couponCode": "SAVE-NOPE2345" }
+
+# ---------------------------------------------------------------------------
+# Admin views
+# ---------------------------------------------------------------------------
+
+### All coupons
+GET {{base}}/admin/coupons
+
+### Report (read-only; run it twice, the bodies are identical)
+GET {{base}}/admin/report

@@ -15,7 +15,8 @@
     "dev": "tsx watch src/server.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "demo:race": "tsx scripts/demo-concurrency.ts"
   },
   "dependencies": {
     "dotenv": "^18.0.9",
