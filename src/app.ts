@@ -1,6 +1,8 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import { ZodError } from 'zod';
 import { loadConfig, type Config } from './config';
 import { createPool, type Pool } from './db';
+import { AppError, errorBody, errors } from './errors';
 import { healthRoutes } from './routes/health';
 
 declare module 'fastify' {
@@ -26,6 +28,52 @@ export async function buildApp(configOverrides: Partial<Config> = {}): Promise<F
     await pool.end();
   });
 
+  registerErrorHandling(app);
   await app.register(healthRoutes);
   return app;
+}
+
+/**
+ * Every error leaves as { error: { code, message, details? } }. Only AppError, zod issues
+ * and Fastify's own client-error messages reach the client; anything else becomes a
+ * generic 500 so stack traces, SQL and driver messages never leak.
+ */
+function registerErrorHandling(app: FastifyInstance): void {
+  app.setNotFoundHandler((request, reply) => {
+    const err = errors.routeNotFound(request.method, request.url);
+    void reply.status(err.httpStatus).send(errorBody(err));
+  });
+
+  app.setErrorHandler((err: unknown, request, reply) => {
+    const appError = toAppError(err);
+    if (appError) {
+      return reply.status(appError.httpStatus).send(errorBody(appError));
+    }
+    request.log.error({ err }, 'unhandled error');
+    return reply.status(500).send({
+      error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' },
+    });
+  });
+}
+
+function toAppError(err: unknown): AppError | undefined {
+  if (err instanceof AppError) return err;
+  if (err instanceof ZodError) {
+    return errors.validation('Request validation failed', {
+      issues: err.issues.map((i) => ({ path: i.path.join('.'), message: i.message })),
+    });
+  }
+  // Fastify's own 4xx errors: malformed JSON, empty JSON body, unsupported content type,
+  // body too large. All are client input problems.
+  const fe = err as Partial<FastifyError>;
+  if (
+    typeof fe.code === 'string' &&
+    fe.code.startsWith('FST_') &&
+    typeof fe.statusCode === 'number' &&
+    fe.statusCode >= 400 &&
+    fe.statusCode < 500
+  ) {
+    return errors.validation(fe.message ?? 'Invalid request');
+  }
+  return undefined;
 }
