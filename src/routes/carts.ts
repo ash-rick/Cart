@@ -3,7 +3,12 @@ import { z } from 'zod';
 import { createCart, getCart, removeItem, setItemQuantity } from '../services/cartService';
 
 const cartParams = z.object({ cartId: z.string() });
-const itemParams = z.object({ cartId: z.string(), productId: z.string().min(1) });
+// Product ids are short slugs (sku_mug). Anything else cannot name a product, and odd
+// bytes (NUL is invalid in Postgres text) must not reach SQL.
+const productIdSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{1,64}$/, 'productId must be 1-64 letters, digits, _ or -');
+const itemParams = z.object({ cartId: z.string(), productId: productIdSchema });
 const setQuantityBody = z.object({ quantity: z.number().int().min(1).max(100) });
 
 export async function cartRoutes(app: FastifyInstance): Promise<void> {

@@ -1,4 +1,4 @@
-import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyError, type FastifyInstance, type FastifyReply } from 'fastify';
 import { ZodError } from 'zod';
 import { loadConfig, type Config } from './config';
 import { createPool, type Pool } from './db';
@@ -22,7 +22,17 @@ declare module 'fastify' {
  */
 export async function buildApp(configOverrides: Partial<Config> = {}): Promise<FastifyInstance> {
   const config = loadConfig(configOverrides);
-  const app = Fastify({ logger: process.env.NODE_ENV === 'test' ? false : { level: 'info' } });
+  const app = Fastify({
+    logger: process.env.NODE_ENV === 'test' ? false : { level: 'info' },
+    // Let long path params reach zod (400) instead of the router's own 414.
+    maxParamLength: 1000,
+    // Router-level errors (e.g. invalid percent-encoding) bypass setErrorHandler;
+    // send them in the standard shape too.
+    frameworkErrors: (err, _request, reply) => {
+      const appError = errors.validation(err.message);
+      void (reply as FastifyReply).status(appError.httpStatus).send(errorBody(appError));
+    },
+  });
 
   const pool = createPool(config.databaseUrl);
   pool.on('error', (err) => app.log.error({ err }, 'idle pg client error'));

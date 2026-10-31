@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
-import { closeDb, makeApp, resetDb } from './helpers';
+import { cartWith, closeDb, createCart, makeApp, resetDb } from './helpers';
 
 describe('error responses', () => {
   let app: FastifyInstance;
@@ -53,5 +53,45 @@ describe('error responses', () => {
       error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' },
     });
     expect(res.body).not.toContain('secret_table');
+  });
+
+  // Inputs that used to reach Postgres (NUL bytes are invalid in text: 22021) or Fastify's
+  // router and came back as 500s or in Fastify's own error shape.
+  it.each([
+    ['PUT', 'items/a%00b', { quantity: 1 }],
+    ['DELETE', 'items/a%00b', undefined],
+    ['PUT', `items/${'x'.repeat(150)}`, { quantity: 1 }],
+    ['PUT', 'items/sku mug', { quantity: 1 }],
+  ])('%s with a malformed product id %# -> 400 VALIDATION_ERROR', async (method, path, payload) => {
+    const cartId = await createCart(app);
+    const res = await app.inject({
+      method: method as 'PUT' | 'DELETE',
+      url: `/carts/${cartId}/${path}`,
+      ...(payload ? { payload } : {}),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('VALIDATION_ERROR');
+  });
+
+  // 'A\\u0000B' is the JSON escape for a NUL byte: valid JSON, invalid Postgres text.
+  it.each(['A\\u0000B','SAVE-AB12!', 'x'.repeat(65)])(
+    'checkout with malformed couponCode %# -> 400 VALIDATION_ERROR',
+    async (couponCode) => {
+      const cartId = await cartWith(app, { sku_mug: 1 });
+      const res = await app.inject({
+        method: 'POST',
+        url: `/carts/${cartId}/checkout`,
+        headers: { 'content-type': 'application/json' },
+        payload: `{"couponCode":"${couponCode}"}`,
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.code).toBe('VALIDATION_ERROR');
+    },
+  );
+
+  it('a URL that is not valid percent-encoding -> 400 in the standard error shape', async () => {
+    const res = await app.inject({ method: 'GET', url: '/carts/%E0%A4%A' });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ error: { code: 'VALIDATION_ERROR' } });
   });
 });

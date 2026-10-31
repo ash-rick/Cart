@@ -9,7 +9,12 @@ const orderParams = z.object({ orderId: z.string() });
 // checking out without the discount the client thinks it asked for.
 const checkoutBody = z
   .object({
-    couponCode: z.string().max(64).optional(),
+    couponCode: z
+      .string()
+      .trim()
+      .max(64)
+      .regex(/^[A-Za-z0-9-]*$/, 'couponCode may contain only letters, digits and -')
+      .optional(),
     expectedTotalCents: z.number().int().min(0).optional(),
   })
   .strict();
